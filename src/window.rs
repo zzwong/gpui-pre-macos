@@ -77,7 +77,7 @@ use std::{
         Arc, Once, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
@@ -665,7 +665,10 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
-    idle_frames: IdleFrames,
+    frame_demand: FrameDemand,
+    // Set when the `MacWindow` is dropped; `closed` is only set later, when
+    // the deferred `close` runs.
+    dropped: bool,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -834,7 +837,10 @@ impl MacWindowState {
 
     fn start_display_link(&mut self) {
         self.stop_display_link();
-        self.idle_frames.reset();
+        self.frame_demand.record(Instant::now());
+        if self.dropped || self.closed.load(Ordering::Acquire) {
+            return;
+        }
         unsafe {
             if !self
                 .native_window
@@ -864,12 +870,14 @@ impl MacWindowState {
     /// Records frame demand, restarting the display link if it was stopped
     /// because the window went idle.
     fn wake_display_link(&mut self) {
-        self.idle_frames.reset();
-        if !self.closed.load(Ordering::Acquire)
-            && !self
-                .frame_source
-                .as_ref()
-                .is_some_and(WindowFrameSource::is_running)
+        if self.dropped || self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        self.frame_demand.record(Instant::now());
+        if !self
+            .frame_source
+            .as_ref()
+            .is_some_and(WindowFrameSource::is_running)
         {
             self.start_display_link();
         }
@@ -969,36 +977,38 @@ impl MacWindowState {
 
 unsafe impl Send for MacWindowState {}
 
-/// How many consecutive display-link frames a window may go without drawing,
-/// presenting or being asked for another frame before its display link is
-/// stopped. A few frames of slack keep bursty demand (typing, short timers)
-/// from stopping and restarting the link on every frame.
-const IDLE_FRAMES_BEFORE_STOP: u32 = 4;
+/// How long a window's display link keeps running after the last frame
+/// demand. Long enough that typing and short timers (a caret blink, a spinner)
+/// don't stop and restart the `CVDisplayLink` between every event, short
+/// enough that an idle window stops waking the main thread almost at once.
+const IDLE_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// Counts consecutive idle display-link frames.
+/// When a window last had frame demand, so its display link can be stopped
+/// once the window is idle.
 ///
 /// GPUI calls the window's frame waker whenever frame demand arises (a view is
 /// notified, the window is refreshed, or a next-frame callback is scheduled),
-/// and again after any frame that leaves demand behind. A window that goes
-/// several frames without drawing and without such a wake has nothing to
-/// draw, so its display link can stop until the next wake instead of waking
-/// the main thread at the display's refresh rate.
-#[derive(Default)]
-struct IdleFrames(u32);
+/// and again after any frame that leaves demand behind. Every draw and present
+/// also counts as demand. A window that has gone `IDLE_TIMEOUT` without any of
+/// these has nothing to draw, so its display link can stop until the next wake
+/// instead of waking the main thread at the display's refresh rate.
+struct FrameDemand {
+    last: Instant,
+}
 
-impl IdleFrames {
-    /// Called before each frame request is delivered.
-    fn frame_started(&mut self) {
-        self.0 = self.0.saturating_add(1);
+impl FrameDemand {
+    fn new(now: Instant) -> Self {
+        Self { last: now }
     }
 
-    /// Called on any sign of frame demand: a draw, a wake or input.
-    fn reset(&mut self) {
-        self.0 = 0;
+    /// Called on any sign of frame demand: a draw, a wake or a (re)start.
+    fn record(&mut self, now: Instant) {
+        self.last = now;
     }
 
-    fn is_idle(&self) -> bool {
-        self.0 >= IDLE_FRAMES_BEFORE_STOP
+    /// Checked after each frame request is delivered.
+    fn is_idle(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last) >= IDLE_TIMEOUT
     }
 }
 
@@ -1147,7 +1157,8 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
-                idle_frames: IdleFrames::default(),
+                frame_demand: FrameDemand::new(Instant::now()),
+                dropped: false,
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -1434,6 +1445,7 @@ impl Drop for MacWindow {
         // the adapter here so the native view, its `CAMetalLayer` and the
         // renderer's command queue are actually released with the window.
         drop(this.accesskit_adapter.take());
+        this.dropped = true;
         this.renderer.destroy();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
@@ -2188,7 +2200,7 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
-        this.idle_frames.reset();
+        this.frame_demand.record(Instant::now());
         this.renderer.draw(scene);
     }
 
@@ -2856,9 +2868,6 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let window_state = unsafe { get_window_state(this) };
     let weak_window_state = Arc::downgrade(&window_state);
     let mut lock = window_state.as_ref().lock();
-    // Input can require presentation without invalidating anything (GPUI keeps
-    // presenting during high-rate input so the display doesn't underclock).
-    lock.wake_display_link();
     let window_height = lock.content_size().height;
     let native_event_type = unsafe { native_event.eventType() };
     match native_event_type {
@@ -3385,14 +3394,13 @@ extern "C" fn step(view: *mut c_void) {
     let mut lock = window_state.lock();
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
-        lock.idle_frames.frame_started();
         drop(lock);
         callback(Default::default());
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
-        // Nothing drew, presented or asked for a frame for several frames:
-        // stop until the frame waker, input or a visibility change restarts it.
-        if lock.idle_frames.is_idle() {
+        // Nothing drew, presented or asked for a frame for a while: stop until
+        // the frame waker or a visibility change restarts the link.
+        if lock.frame_demand.is_idle(Instant::now()) {
             lock.stop_display_link();
         }
     }
@@ -3997,25 +4005,38 @@ mod tests {
     }
 
     #[test]
-    fn idle_frames_stop_only_after_consecutive_idle_frames() {
-        let mut idle = IdleFrames::default();
-        for _ in 1..IDLE_FRAMES_BEFORE_STOP {
-            idle.frame_started();
-            assert!(!idle.is_idle());
-        }
-        idle.frame_started();
-        assert!(idle.is_idle());
+    fn frame_demand_goes_idle_only_after_the_timeout() {
+        let start = Instant::now();
+        let demand = FrameDemand::new(start);
+        assert!(!demand.is_idle(start));
+        assert!(!demand.is_idle(start + IDLE_TIMEOUT - Duration::from_millis(1)));
+        assert!(demand.is_idle(start + IDLE_TIMEOUT));
     }
 
     #[test]
-    fn idle_frames_demand_during_a_frame_keeps_the_link_running() {
-        let mut idle = IdleFrames::default();
-        for _ in 0..IDLE_FRAMES_BEFORE_STOP * 3 {
-            idle.frame_started();
-            // A draw or wake while the frame runs (e.g. a next-frame callback
-            // chain or continuous animation) must never let the count build up.
-            idle.reset();
-            assert!(!idle.is_idle());
+    fn frame_demand_keeps_the_link_running_while_demand_continues() {
+        // A frame every 8 ms (120 Hz) that draws or wakes, as continuous
+        // animation or a next-frame-callback chain does, never goes idle,
+        // however long it runs.
+        let start = Instant::now();
+        let mut demand = FrameDemand::new(start);
+        for frame in 1..100u32 {
+            let now = start + Duration::from_millis(8) * frame;
+            demand.record(now);
+            assert!(!demand.is_idle(now));
+        }
+    }
+
+    #[test]
+    fn frame_demand_bridges_gaps_shorter_than_the_timeout() {
+        // Keystrokes or timer ticks 100 ms apart keep the link running
+        // between them instead of stopping and restarting it each time.
+        let start = Instant::now();
+        let mut demand = FrameDemand::new(start);
+        for tick in 1..10u32 {
+            let now = start + Duration::from_millis(100) * tick;
+            assert!(!demand.is_idle(now));
+            demand.record(now);
         }
     }
 }
