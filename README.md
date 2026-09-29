@@ -11,11 +11,12 @@ snapshot stops the display link of idle windows:
   visible, so the main thread woke at the display's refresh rate to run a
   frame callback that found nothing dirty. The patch implements GPUI's
   `frame_waker` for macOS, the hook the web platform already uses: the link
-  stops after four consecutive frames that neither draw nor present nor ask
-  for another frame, and restarts when the window is invalidated, schedules a
-  next-frame or animation-frame callback, receives input, or becomes visible
-  or changes screens. Continuous animation keeps the link running because
-  every frame draws. See [diffz#76](https://github.com/zzwong/diffz/issues/76).
+  stops once 200 ms pass without a draw, a present or a request for another
+  frame, and restarts when the window is invalidated, schedules a next-frame
+  or animation-frame callback, or becomes visible or changes screens.
+  Continuous animation keeps the link running because every frame draws, and
+  the 200 ms grace keeps typing and short timers from restarting it on every
+  event. See [diffz#76](https://github.com/zzwong/diffz/issues/76).
 
 Before the patch, diffz measured about 0.3–0.7% CPU and 300 context switches a
 second in a visible idle window (release build, 30 s of `top`, macOS 15.7);
